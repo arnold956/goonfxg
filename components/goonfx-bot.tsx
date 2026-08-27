@@ -108,11 +108,14 @@ export function GoonFxBot() {
     setLastAction(`Submitting live ${trading.activeSymbol?.symbol ?? 'market'} trade…`);
 
     try {
-      // Deriv's current Buy API supports buying with buy=1 and passing the
-      // contract parameters directly. This removes the stale proposal-ID path
-      // that caused GOON FX to show "Unknown contract proposal".
+      // Deriv supports a direct buy request with buy=1 and contract
+      // parameters. `price` is the maximum price the account authorizes for
+      // this purchase. Using the requested stake as that ceiling avoids a
+      // stale proposal-ID dependency while still letting Deriv validate the
+      // contract parameters on the authenticated account.
       const result = await ws.send<BuyResponse>({
         buy: 1,
+        price: tradeParams.amount,
         parameters: {
           amount: tradeParams.amount,
           basis: 'stake',
@@ -213,7 +216,7 @@ export function GoonFxBot() {
               <div className="flex justify-between"><span>Execution</span><b>DIRECT BUY</b></div>
               <div className="flex justify-between"><span>Status</span><b>{lastAction}</b></div>
             </div>
-            <p className="mt-4 text-xs text-muted-foreground">GOON FX sends the contract parameters directly to Deriv's authenticated Buy endpoint; no proposal ID is exposed or reused.</p>
+            <p className="mt-4 text-xs text-muted-foreground">The proposal/price negotiation is handled by Deriv's Buy endpoint; GOON FX does not expose proposal IDs.</p>
           </div>
 
           <div className="rounded-xl border p-4">
