@@ -1,7 +1,6 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useBuy } from '@deriv/core';
 import { useDerivWSContext } from '@/components/custom/deriv-ws-provider';
 import { useBaseTrading } from '@/hooks/use-base-trading';
 import { useAccumulatorProposal } from '@/hooks/use-accumulator-proposal';
@@ -26,9 +25,29 @@ function rsi(values: number[], period = 14) {
   return 100 - 100 / (1 + gain / loss);
 }
 
+type BuyResponse = {
+  buy?: {
+    contract_id: number;
+    buy_price: number | string;
+    payout: number | string;
+    balance_after: number | string;
+    transaction_id: number;
+  };
+  error?: { code?: string; message?: string };
+};
+
+type ProposalResponse = {
+  proposal?: {
+    id: string;
+    ask_price: number | string;
+    payout?: number | string;
+  };
+  error?: { code?: string; message?: string };
+};
+
 export function GoonFxBot() {
   const { ws, isConnected, isExhausted, auth } = useDerivWSContext();
-  const authenticated = !!auth.wsUrl;
+  const authenticated = !!auth.wsUrl && auth.authState === 'authenticated';
   const trading = useBaseTrading({
     ws,
     isConnected,
@@ -49,6 +68,9 @@ export function GoonFxBot() {
   const [signal, setSignal] = useState<'BUY' | 'WAIT'>('WAIT');
   const [signalScore, setSignalScore] = useState(0);
   const [startedAt, setStartedAt] = useState<number | null>(null);
+  const [isExecuting, setIsExecuting] = useState(false);
+  const [buyResult, setBuyResult] = useState<BuyResponse['buy'] | null>(null);
+  const [buyError, setBuyError] = useState<string | null>(null);
   const lastTradeRef = useRef(0);
 
   const prices = trading.prices;
@@ -69,8 +91,7 @@ export function GoonFxBot() {
       if (rsi14 > 50 && rsi14 < 70) score += 1;
       if (rsi14 < 50 && rsi14 > 30) score -= 1;
     }
-    const buy = score >= 2;
-    return { score, buy };
+    return { score, buy: score >= 2 };
   }, [fast, slow, momentum, rsi14]);
 
   useEffect(() => {
@@ -80,36 +101,81 @@ export function GoonFxBot() {
 
   const proposalParams = useMemo(() => {
     const amount = Number(stake);
-    if (!trading.activeSymbol || !Number.isFinite(amount) || amount <= 0) return null;
+    const currency = auth.activeAccount?.currency;
+    if (!trading.activeSymbol || !Number.isFinite(amount) || amount <= 0 || !currency) return null;
     return {
       symbol: trading.activeSymbol.underlying_symbol,
       amount,
       growthRate,
-      currency: 'USD',
+      currency,
     };
-  }, [trading.activeSymbol, stake, growthRate]);
+  }, [trading.activeSymbol, stake, growthRate, auth.activeAccount?.currency]);
 
+  // Kept for the live analysis/display layer. Execution deliberately requests
+  // a fresh, non-subscribed proposal immediately before BUY so the proposal ID
+  // and ask price cannot go stale between ticks.
   const { proposal } = useAccumulatorProposal(ws, isConnected, proposalParams);
-  const { buyContract, isBuying, buyResult, buyError } = useBuy(ws, isConnected);
 
   const executeTrade = useCallback(async () => {
-    if (!authenticated || !armed || !proposal || isBuying || tradeCount >= maxTrades) return;
+    if (!ws || !isConnected || !authenticated || !armed || !proposalParams || isExecuting || tradeCount >= maxTrades) return;
     if (Date.now() - lastTradeRef.current < cooldown * 1000) return;
+
+    setIsExecuting(true);
+    setBuyError(null);
+    setBuyResult(null);
     lastTradeRef.current = Date.now();
-    setLastAction(`Executing ${trading.activeSymbol?.symbol ?? 'market'} trade`);
+    setLastAction(`Requesting live ${trading.activeSymbol?.symbol ?? 'market'} price…`);
+
     try {
-      await buyContract(proposal);
+      const freshProposal = await ws.send<ProposalResponse>({
+        proposal: 1,
+        amount: proposalParams.amount,
+        basis: 'stake',
+        contract_type: 'ACCU',
+        currency: proposalParams.currency,
+        underlying_symbol: proposalParams.symbol,
+        growth_rate: proposalParams.growthRate,
+      });
+
+      if (freshProposal.error) {
+        throw new Error(freshProposal.error.message ?? freshProposal.error.code ?? 'Deriv proposal failed');
+      }
+
+      const id = freshProposal.proposal?.id;
+      const askPrice = Number(freshProposal.proposal?.ask_price);
+      if (!id || !Number.isFinite(askPrice) || askPrice <= 0) {
+        throw new Error('Deriv returned an invalid live price. Trade was not submitted.');
+      }
+
+      setLastAction('Submitting live trade…');
+      const result = await ws.send<BuyResponse>({
+        buy: id,
+        price: askPrice,
+      });
+
+      if (result.error) {
+        throw new Error(result.error.message ?? result.error.code ?? 'Deriv buy failed');
+      }
+      if (!result.buy?.contract_id) {
+        throw new Error('Deriv did not confirm the contract purchase.');
+      }
+
+      setBuyResult(result.buy);
       setTradeCount(c => c + 1);
-      setLastAction('Live trade executed');
+      setLastAction(`LIVE TRADE EXECUTED — contract ${result.buy?.contract_id}`);
     } catch (e) {
-      setLastAction(e instanceof Error ? e.message : 'Trade failed');
+      const message = e instanceof Error ? e.message : 'Trade failed';
+      setBuyError(message);
+      setLastAction(`Trade rejected: ${message}`);
+    } finally {
+      setIsExecuting(false);
     }
-  }, [authenticated, armed, proposal, isBuying, tradeCount, maxTrades, cooldown, buyContract, trading.activeSymbol]);
+  }, [ws, isConnected, authenticated, armed, proposalParams, isExecuting, tradeCount, maxTrades, cooldown, trading.activeSymbol, proposal]);
 
   useEffect(() => {
-    if (!auto || !armed || signal !== 'BUY' || tradeCount >= maxTrades) return;
+    if (!auto || !armed || signal !== 'BUY' || tradeCount >= maxTrades || isExecuting) return;
     void executeTrade();
-  }, [auto, armed, signal, tradeCount, maxTrades, executeTrade]);
+  }, [auto, armed, signal, tradeCount, maxTrades, isExecuting, executeTrade]);
 
   useEffect(() => {
     if (!startedAt) return;
@@ -125,12 +191,16 @@ export function GoonFxBot() {
   const toggleArmed = () => {
     if (!armed) {
       if (!authenticated) {
-        setLastAction('Login to Deriv before arming live execution');
+        setLastAction('Connect and authorize your Deriv account before live execution');
+        return;
+      }
+      if (!auth.activeAccount?.account_type) {
+        setLastAction('No active Deriv account selected');
         return;
       }
       setTradeCount(0);
       setStartedAt(Date.now());
-      setLastAction('LIVE EXECUTION ARMED');
+      setLastAction(`LIVE EXECUTION ARMED — ${auth.activeAccount.account_type.toUpperCase()} ACCOUNT`);
     } else {
       setAuto(false);
       setLastAction('Live execution disarmed');
@@ -144,11 +214,12 @@ export function GoonFxBot() {
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h2 className="text-xl font-bold">GOON FX Bot & Analysis</h2>
-            <p className="text-sm text-muted-foreground">Live Deriv ticks → analysis → optional automated execution</p>
+            <p className="text-sm text-muted-foreground">Live Deriv ticks → analysis → direct execution</p>
           </div>
           <div className="flex items-center gap-2 text-sm">
             <span className={`h-2.5 w-2.5 rounded-full ${isConnected ? 'bg-emerald-500' : 'bg-red-500'}`} />
             {isConnected ? 'Deriv connected' : 'Disconnected'}
+            {auth.activeAccount && <span className="rounded-full border px-2 py-1">{auth.activeAccount.account_type.toUpperCase()} · {auth.activeAccount.currency}</span>}
             <span className="rounded-full border px-2 py-1">{trading.activeSymbol?.symbol ?? '—'}</span>
           </div>
         </div>
@@ -168,25 +239,26 @@ export function GoonFxBot() {
               <div className="flex justify-between"><span>Fast MA (5)</span><b>{fast?.toFixed(5) ?? '—'}</b></div>
               <div className="flex justify-between"><span>Slow MA (14)</span><b>{slow?.toFixed(5) ?? '—'}</b></div>
               <div className="flex justify-between"><span>Current tick</span><b>{trading.currentTick?.quote ?? '—'}</b></div>
-              <div className="flex justify-between"><span>Analysis status</span><b>{lastAction}</b></div>
+              <div className="flex justify-between"><span>Live proposal</span><b>{proposal ? 'READY' : 'WAITING'}</b></div>
+              <div className="flex justify-between"><span>Status</span><b>{lastAction}</b></div>
             </div>
-            <p className="mt-4 text-xs text-muted-foreground">Signals are statistical indicators, not guaranteed predictions. The bot only executes when you explicitly arm live execution.</p>
+            <p className="mt-4 text-xs text-muted-foreground">A fresh Deriv price is requested immediately before each BUY. The app never uses a stale proposal ID.</p>
           </div>
 
           <div className="rounded-xl border p-4">
-            <h3 className="font-semibold">Bot execution</h3>
+            <h3 className="font-semibold">Direct trade execution</h3>
             <div className="mt-3 grid gap-3 sm:grid-cols-2">
               <label className="text-sm">Stake<input value={stake} onChange={e => setStake(e.target.value)} className="mt-1 w-full rounded-lg border bg-background px-3 py-2" inputMode="decimal" /></label>
               <label className="text-sm">Growth rate<select value={growthRate} onChange={e => setGrowthRate(Number(e.target.value))} className="mt-1 w-full rounded-lg border bg-background px-3 py-2"><option value={0.01}>1%</option><option value={0.02}>2%</option><option value={0.03}>3%</option><option value={0.04}>4%</option><option value={0.05}>5%</option></select></label>
-              <label className="text-sm">Max trades/day<input type="number" min="1" max="100" value={maxTrades} onChange={e => setMaxTrades(Math.max(1, Number(e.target.value) || 1))} className="mt-1 w-full rounded-lg border bg-background px-3 py-2" /></label>
+              <label className="text-sm">Max trades/session<input type="number" min="1" max="100" value={maxTrades} onChange={e => setMaxTrades(Math.max(1, Number(e.target.value) || 1))} className="mt-1 w-full rounded-lg border bg-background px-3 py-2" /></label>
               <label className="text-sm">Cooldown (seconds)<input type="number" min="5" value={cooldown} onChange={e => setCooldown(Math.max(5, Number(e.target.value) || 5))} className="mt-1 w-full rounded-lg border bg-background px-3 py-2" /></label>
             </div>
             <div className="mt-4 flex flex-wrap gap-2">
               <button onClick={toggleArmed} className={`rounded-lg px-4 py-2 font-semibold ${armed ? 'bg-red-600 text-white' : 'bg-emerald-600 text-white'}`}>{armed ? 'DISARM LIVE' : 'ARM LIVE EXECUTION'}</button>
-              <button disabled={!armed || signal !== 'BUY' || isBuying} onClick={() => void executeTrade()} className="rounded-lg border px-4 py-2 font-semibold disabled:cursor-not-allowed disabled:opacity-50">{isBuying ? 'EXECUTING…' : 'EXECUTE SIGNAL'}</button>
+              <button disabled={!armed || signal !== 'BUY' || isExecuting} onClick={() => void executeTrade()} className="rounded-lg border px-4 py-2 font-semibold disabled:cursor-not-allowed disabled:opacity-50">{isExecuting ? 'EXECUTING…' : 'EXECUTE TRADE'}</button>
               <label className="flex items-center gap-2 rounded-lg border px-3 py-2 text-sm"><input type="checkbox" checked={auto} disabled={!armed} onChange={e => setAuto(e.target.checked)} /> Auto bot</label>
             </div>
-            {buyResult && <div className="mt-3 rounded-lg border p-3 text-sm">Contract opened: <b>{String((buyResult as any).contract_id ?? 'confirmed')}</b></div>}
+            {buyResult && <div className="mt-3 rounded-lg border p-3 text-sm">LIVE CONTRACT: <b>{String(buyResult.contract_id)}</b> · Buy price {String(buyResult.buy_price)} · Balance after {String(buyResult.balance_after)}</div>}
             {buyError && <div className="mt-3 rounded-lg border border-red-300 p-3 text-sm text-red-600">{buyError}</div>}
           </div>
         </div>
