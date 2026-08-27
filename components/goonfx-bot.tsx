@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useDerivWSContext } from '@/components/custom/deriv-ws-provider';
 import { useBaseTrading } from '@/hooks/use-base-trading';
-import { useAccumulatorProposal } from '@/hooks/use-accumulator-proposal';
 
 function sma(values: number[], period: number) {
   if (values.length < period) return null;
@@ -32,15 +31,6 @@ type BuyResponse = {
     payout: number | string;
     balance_after: number | string;
     transaction_id: number;
-  };
-  error?: { code?: string; message?: string };
-};
-
-type ProposalResponse = {
-  proposal?: {
-    id: string;
-    ask_price: number | string;
-    payout?: number | string;
   };
   error?: { code?: string; message?: string };
 };
@@ -99,70 +89,51 @@ export function GoonFxBot() {
     setSignal(analysis.buy ? 'BUY' : 'WAIT');
   }, [analysis]);
 
-  const proposalParams = useMemo(() => {
+  const tradeParams = useMemo(() => {
     const amount = Number(stake);
     const currency = auth.activeAccount?.currency;
-    if (!trading.activeSymbol || !Number.isFinite(amount) || amount <= 0 || !currency) return null;
-    return {
-      symbol: trading.activeSymbol.underlying_symbol,
-      amount,
-      growthRate,
-      currency,
-    };
-  }, [trading.activeSymbol, stake, growthRate, auth.activeAccount?.currency]);
-
-  // Kept for the live analysis/display layer. Execution deliberately requests
-  // a fresh, non-subscribed proposal immediately before BUY so the proposal ID
-  // and ask price cannot go stale between ticks.
-  const { proposal } = useAccumulatorProposal(ws, isConnected, proposalParams);
+    const symbol = trading.activeSymbol?.underlying_symbol;
+    if (!symbol || !currency || !Number.isFinite(amount) || amount <= 0) return null;
+    return { amount, currency, symbol, growthRate };
+  }, [stake, auth.activeAccount?.currency, trading.activeSymbol, growthRate]);
 
   const executeTrade = useCallback(async () => {
-    if (!ws || !isConnected || !authenticated || !armed || !proposalParams || isExecuting || tradeCount >= maxTrades) return;
+    if (!ws || !isConnected || !authenticated || !armed || !tradeParams || isExecuting || tradeCount >= maxTrades) return;
     if (Date.now() - lastTradeRef.current < cooldown * 1000) return;
 
     setIsExecuting(true);
     setBuyError(null);
     setBuyResult(null);
     lastTradeRef.current = Date.now();
-    setLastAction(`Requesting live ${trading.activeSymbol?.symbol ?? 'market'} price…`);
+    setLastAction(`Submitting live ${trading.activeSymbol?.symbol ?? 'market'} trade…`);
 
     try {
-      const freshProposal = await ws.send<ProposalResponse>({
-        proposal: 1,
-        amount: proposalParams.amount,
-        basis: 'stake',
-        contract_type: 'ACCU',
-        currency: proposalParams.currency,
-        underlying_symbol: proposalParams.symbol,
-        growth_rate: proposalParams.growthRate,
-      });
-
-      if (freshProposal.error) {
-        throw new Error(freshProposal.error.message ?? freshProposal.error.code ?? 'Deriv proposal failed');
-      }
-
-      const id = freshProposal.proposal?.id;
-      const askPrice = Number(freshProposal.proposal?.ask_price);
-      if (!id || !Number.isFinite(askPrice) || askPrice <= 0) {
-        throw new Error('Deriv returned an invalid live price. Trade was not submitted.');
-      }
-
-      setLastAction('Submitting live trade…');
+      // Deriv's current Buy API supports buying with buy=1 and passing the
+      // contract parameters directly. This removes the stale proposal-ID path
+      // that caused GOON FX to show "Unknown contract proposal".
       const result = await ws.send<BuyResponse>({
-        buy: id,
-        price: askPrice,
+        buy: 1,
+        parameters: {
+          amount: tradeParams.amount,
+          basis: 'stake',
+          contract_type: 'ACCU',
+          currency: tradeParams.currency,
+          underlying_symbol: tradeParams.symbol,
+          growth_rate: tradeParams.growthRate,
+        },
+        subscribe: 1,
       });
 
       if (result.error) {
         throw new Error(result.error.message ?? result.error.code ?? 'Deriv buy failed');
       }
       if (!result.buy?.contract_id) {
-        throw new Error('Deriv did not confirm the contract purchase.');
+        throw new Error('Deriv did not confirm the purchase.');
       }
 
       setBuyResult(result.buy);
       setTradeCount(c => c + 1);
-      setLastAction(`LIVE TRADE EXECUTED — contract ${result.buy?.contract_id}`);
+      setLastAction(`LIVE TRADE EXECUTED — contract ${result.buy.contract_id}`);
     } catch (e) {
       const message = e instanceof Error ? e.message : 'Trade failed';
       setBuyError(message);
@@ -170,7 +141,7 @@ export function GoonFxBot() {
     } finally {
       setIsExecuting(false);
     }
-  }, [ws, isConnected, authenticated, armed, proposalParams, isExecuting, tradeCount, maxTrades, cooldown, trading.activeSymbol, proposal]);
+  }, [ws, isConnected, authenticated, armed, tradeParams, isExecuting, tradeCount, maxTrades, cooldown, trading.activeSymbol]);
 
   useEffect(() => {
     if (!auto || !armed || signal !== 'BUY' || tradeCount >= maxTrades || isExecuting) return;
@@ -239,10 +210,10 @@ export function GoonFxBot() {
               <div className="flex justify-between"><span>Fast MA (5)</span><b>{fast?.toFixed(5) ?? '—'}</b></div>
               <div className="flex justify-between"><span>Slow MA (14)</span><b>{slow?.toFixed(5) ?? '—'}</b></div>
               <div className="flex justify-between"><span>Current tick</span><b>{trading.currentTick?.quote ?? '—'}</b></div>
-              <div className="flex justify-between"><span>Live proposal</span><b>{proposal ? 'READY' : 'WAITING'}</b></div>
+              <div className="flex justify-between"><span>Execution</span><b>DIRECT BUY</b></div>
               <div className="flex justify-between"><span>Status</span><b>{lastAction}</b></div>
             </div>
-            <p className="mt-4 text-xs text-muted-foreground">A fresh Deriv price is requested immediately before each BUY. The app never uses a stale proposal ID.</p>
+            <p className="mt-4 text-xs text-muted-foreground">GOON FX sends the contract parameters directly to Deriv's authenticated Buy endpoint; no proposal ID is exposed or reused.</p>
           </div>
 
           <div className="rounded-xl border p-4">
